@@ -105,10 +105,14 @@ class Quantizer():
             weight_quantizer (Type[WeightQuantizer]): The weight quantizer class to be applied to layers.
             activation_quantizer (Type[ActivationQuantizer]): The activation quantizer class to be applied to layers.
         """
+        # Store the quantizer classes for later use
         self.weight_quantizer_class = weight_quantizer
         self.activation_quantizer_class = activation_quantizer
 
-    def apply(self, module: nn.Module, name_: str = 'weight') -> nn.Module:
+        # Dictionary to store hook handles for each module
+        self._hook_handles = {}
+
+    def wrap(self, module: nn.Module, name_: str = 'weight') -> nn.Module:
         """Applies quantization in-place to a PyTorch layer.
 
         Attaches a weight parametrization for ternary weights and a forward 
@@ -121,14 +125,67 @@ class Quantizer():
         Returns:
             nn.Module: The modified module with BitNet b1.58 operations attached.
         """
+        # Store handles for hooks to allow later removal
+        handles = []
+
         if hasattr(module, name_) and isinstance(getattr(module, name_), Tensor):
             if not parametrize.is_parametrized(module, name_):
+                # 1. Register the parametrization
                 weight_quantizer = self.weight_quantizer_class()
                 parametrize.register_parametrization(module, name_, weight_quantizer)
 
-        # Only apply activation quantization to leaf modules to prevent double-quantization
+                # 2. Hook to rename the key back to normal when saving the state_dict
+                def state_dict_hook(mod, state_dict, prefix, local_metadata):
+                    param_key = f"{prefix}parametrizations.{name_}.original"
+                    orig_key = f"{prefix}{name_}"
+                    if param_key in state_dict:
+                        # Move the unquantized weight back to the original key
+                        state_dict[orig_key] = state_dict.pop(param_key)
+                    return state_dict
+
+                # 3. Hook to convert the key back to the parametrized version when loading
+                def load_state_dict_pre_hook(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+                    param_key = f"{prefix}parametrizations.{name_}.original"
+                    orig_key = f"{prefix}{name_}"
+                    if orig_key in state_dict:
+                        # Map the incoming original key to the parametrized location
+                        state_dict[param_key] = state_dict.pop(orig_key)
+
+                # 4. Attach the hooks to the module
+                handles.append(module._register_state_dict_hook(state_dict_hook))
+
+                if hasattr(module, 'register_load_state_dict_pre_hook'):
+                    handles.append(module.register_load_state_dict_pre_hook(load_state_dict_pre_hook))
+                else:
+                    handles.append(module._register_load_state_dict_pre_hook(load_state_dict_pre_hook))
+
+        # Only apply activation quantization to leaf modules
         if len(list(module.children())) == 0:
             activation_quantizer = self.activation_quantizer_class()
             module.register_forward_pre_hook(activation_quantizer.pre_hook)
-            
+
+        # Store all handles associated with this module
+        if handles:
+            self._hook_handles[module] = handles
+
+        return module
+
+    def unwrap(self, module: nn.Module, name_: str = 'weight', leave_quantized: bool = False) -> nn.Module:
+        """Removes quantization parametrizations and hooks from a module.
+
+        Args:
+            module: The quantized module to unwrap.
+            name_: The name of the parametrized tensor (default 'weight').
+            leave_quantized: If False, restores the original continuous weights. 
+                             If True, bakes in the quantized weights permanently.
+        """
+        # 1. Remove the weight parametrization
+        if parametrize.is_parametrized(module, name_):
+            parametrize.remove_parametrizations(module, name_, leave_parametrized=leave_quantized)
+
+        # 2. Remove all registered hooks (state_dict and forward pre-hooks)
+        if module in self._hook_handles:
+            for handle in self._hook_handles.pop(module):
+                handle.remove()
+
         return module
