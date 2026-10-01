@@ -1,0 +1,11 @@
+[build-system]
+requires = ["scikit-build-core", "nanobind"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "bitquant"
+version = "0.1.0"
+dependencies = ["numpy"]
+
+[tool.scikit-build]
+wheel.packages = ["bitquant"]
