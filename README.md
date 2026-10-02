@@ -21,6 +21,7 @@
 - **Straight-Through Estimator (STE):** Fully supports training! Non-differentiable rounding operations are bypassed in the backward pass using STE, allowing gradients to flow to the original weights.
 - **Clean State Checkpoints:** Custom `state_dict` hooks ensure that your quantized model saves and loads weights seamlessly without breaking your model's original parameter keys.
 - **Modular & Extensible:** Mix and match different weight and activation quantizers, or easily write your own by subclassing the base classes.
+- **BETA: Kernel For W1.58A8 GEMV Operation:** Native kernel using `AVX2` for 1.58-bit (I2_S) weight / 8-bit activation GEMV. Still in development.
 
 ## 📦 Available Quantizers
 
@@ -30,6 +31,12 @@
 | `BinaryWeightQuantizer`   | Weight     | Quantizes weights to binary {-1, 1}.                       |
 | `Int8ActivationQuantizer` | Activation | Quantizes input activations to 8-bit integers [-128, 127]. |
 | `Int4ActivationQuantizer` | Activation | Quantizes input activations to 4-bit integers [-8, 7].     |
+
+## ⚙️ Available Kernels
+
+| Kernel Name         | Target ISA | Format           | Description                                                                |
+| :------------------ | :--------- | :--------------- | :------------------------------------------------------------------------- |
+| `gemm_avx2_w1.58a8` | AVX2       | W1.58A8 (`I2_S`) | Vectorized GEMM kernel for ternary weights and 8-bit activations via AVX2. |
 
 ## 📦 Installation
 
@@ -86,6 +93,30 @@ dummy_inputs = torch.randn(4, 1, 28, 28)
 output = model(dummy_inputs)
 ```
 
+And here is an example of using custom kernel to calculate GEMV between 1.58-bit (`I2_S`) matrix and 8-bit vector:
+
+```python
+import numpy as np
+from bitquant.kernel import pack_matrix, compute_gemv
+
+# 1. Define matrix dimensions
+n_rows, n_cols = 128, 128
+
+# 2. Initialize input data
+# Weights: ternary values {-1, 0, 1}
+weights_np = np.random.choice([-1, 0, 1], size=(n_rows, n_cols)).astype(np.int8)
+# Activations: 8-bit integers [-127, 127]
+activation_np = np.random.randint(-127, 127, size=n_cols, dtype=np.int8)
+
+# 3. Pack the weights for the W1.58A8 format
+weights_packed = pack_matrix(weights_np)
+
+# 4. Execute the AVX2 GEMV kernel
+result = compute_gemv(weights_packed, activation_np, n_rows, n_cols)
+
+print("Result shape:", result.shape)
+```
+
 ## 🛠️ How it Works Under the Hood
 
 Instead of subclassing PyTorch layers and breaking parameter naming conventions, `bitquant` uses an outer wrapper pattern:
@@ -118,13 +149,15 @@ When you call `quantizer.unwrap(module, leave_quantized=<leave_quantized>)`:
 
 ## 🗺️ Roadmap
 
-- [x] Non-invasive layer wrapping architecture using `torch.nn.utils.parametrize` and forward pre-hooks
-- [x] Ternary and binary weight quantization with Straight-Through Estimator (STE) support
-- [x] INT8 and INT4 activation quantization with Straight-Through Estimator (STE) support
-- [x] `unwrap` function to restore the converted quantized model back to its original
-- [ ] INT8 and INT4 weight quantization with Straight-Through Estimator (STE) support
-- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations compatible with ONNX/PyTorch on CPU
-- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations compatible with ONNX/PyTorch on NVIDIA GPU
+- [x] Non-invasive layer wrapping architecture using `torch.nn.utils.parametrize` and forward pre-hooks.
+- [x] Ternary and binary weight quantization with Straight-Through Estimator (STE) support.
+- [x] INT8 and INT4 activation quantization with Straight-Through Estimator (STE) support.
+- [x] `unwrap` function to restore the converted quantized model back to its original.
+- [ ] INT8 and INT4 weight quantization with Straight-Through Estimator (STE) support.
+- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on CPU.
+  - [x] AVX2 kernel for GEMV operation (W1.58A8), compatible with `numpy` array.
+  - [ ] AVX2 kernel for GEMM/Conv operation (W1.58A8).
+- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on NVIDIA GPU.
 
 ## 📄 License
 
