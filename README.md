@@ -21,22 +21,25 @@
 - **Straight-Through Estimator (STE):** Fully supports training! Non-differentiable rounding operations are bypassed in the backward pass using STE, allowing gradients to flow to the original weights.
 - **Clean State Checkpoints:** Custom `state_dict` hooks ensure that your quantized model saves and loads weights seamlessly without breaking your model's original parameter keys.
 - **Modular & Extensible:** Mix and match different weight and activation quantizers, or easily write your own by subclassing the base classes.
-- **BETA: Kernel For W1.58A8 GEMV Operation:** Native kernel using `AVX2` for 1.58-bit (I2_S) weight / 8-bit activation GEMV. Still in development.
+- **BETA: Kernels For W1.58A8 / W1.58A4 GEMV Operations:** Native kernels using `AVX2` for 1.58-bit (`I2_S`) weight / 8-bit or 4-bit activation GEMV, plus packing utilities for both formats. Still in development.
 
 ## 📦 Available Quantizers
 
-| Quantizer Class           | Type       | Description                                                |
-| :------------------------ | :--------- | :--------------------------------------------------------- |
-| `TernaryWeightQuantizer`  | Weight     | Quantizes weights to ternary {-1, 0, 1}.                   |
-| `BinaryWeightQuantizer`   | Weight     | Quantizes weights to binary {-1, 1}.                       |
-| `Int8ActivationQuantizer` | Activation | Quantizes input activations to 8-bit integers [-128, 127]. |
-| `Int4ActivationQuantizer` | Activation | Quantizes input activations to 4-bit integers [-8, 7].     |
+| Quantizer Class           | Type       | Description                                                                                 |
+| :------------------------ | :--------- | :------------------------------------------------------------------------------------------ |
+| `TernaryWeightQuantizer`  | Weight     | Quantizes weights to ternary {-1, 0, 1}.                                                    |
+| `BinaryWeightQuantizer`   | Weight     | Quantizes weights to binary {-1, 1}.                                                        |
+| `Int8ActivationQuantizer` | Activation | Quantizes input activations to 8-bit integers [-127, 127] with per-dimension/tensor absmax. |
+| `Int4ActivationQuantizer` | Activation | Quantizes input activations to 4-bit integers [-7, 7] with per-dimension/tensor absmax.     |
 
 ## ⚙️ Available Kernels
 
-| Kernel Name         | Target ISA | Format           | Description                                                                |
-| :------------------ | :--------- | :--------------- | :------------------------------------------------------------------------- |
-| `gemm_avx2_w1.58a8` | AVX2       | W1.58A8 (`I2_S`) | Vectorized GEMM kernel for ternary weights and 8-bit activations via AVX2. |
+| Function               | Target ISA | Format           | Description                                                                                           |
+| :--------------------- | :--------- | :--------------- | :---------------------------------------------------------------------------------------------------- |
+| `compute_gemv_i2_s_a8` | AVX2       | W1.58A8 (`I2_S`) | Vectorized GEMV kernel for ternary weights and 8-bit activations in `[-127, 127]`.                    |
+| `compute_gemv_i2_s_a4` | AVX2       | W1.58A4 (`I2_S`) | Vectorized GEMV kernel for ternary weights and 4-bit activations in `[-7, 7]`.                        |
+| `pack_matrix_i2_s`     | -          | `I2_S`           | Packs an `int8` ternary weight matrix `(n_rows, n_cols)` into `I2_S` (2 bits per weight).             |
+| `pack_activation_int4` | -          | `INT4`           | Packs an `int8` vector of 4-bit-range activations `(n_cols,)` into packed `INT4` (2 values per byte). |
 
 ## 📦 Installation
 
@@ -97,7 +100,7 @@ And here is an example of using custom kernel to calculate GEMV between 1.58-bit
 
 ```python
 import numpy as np
-from bitquant.kernel import pack_matrix, compute_gemv
+from bitquant.kernel import pack_matrix_i2_s, compute_gemv_i2_s_a8
 
 # 1. Define matrix dimensions
 n_rows, n_cols = 128, 128
@@ -109,12 +112,38 @@ weights_np = np.random.choice([-1, 0, 1], size=(n_rows, n_cols)).astype(np.int8)
 activation_np = np.random.randint(-127, 127, size=n_cols, dtype=np.int8)
 
 # 3. Pack the weights for the W1.58A8 format
-weights_packed = pack_matrix(weights_np)
+weights_packed = pack_matrix_i2_s(weights_np)
 
 # 4. Execute the AVX2 GEMV kernel
-result = compute_gemv(weights_packed, activation_np, n_rows, n_cols)
+result = compute_gemv_i2_s_a8(weights_packed, activation_np, n_rows, n_cols)
 
 print("Result shape:", result.shape)
+```
+
+For 4-bit activations, the activation vector must also be packed (2 values per byte) before calling the W1.58A4 kernel:
+
+```python
+import numpy as np
+from bitquant.kernel import pack_matrix_i2_s, pack_activation_int4, compute_gemv_i2_s_a4
+
+# 1. Define matrix dimensions (any n_cols works; inputs are zero-padded to a multiple of 128)
+n_rows, n_cols = 128, 200
+
+# 2. Initialize input data
+# Weights: ternary values {-1, 0, 1}
+weights_np = np.random.choice([-1, 0, 1], size=(n_rows, n_cols)).astype(np.int8)
+# Activations: 4-bit integers [-7, 7], stored one per int8
+activation_np = np.random.randint(-7, 8, size=n_cols, dtype=np.int8)
+
+# 3. Pack the weights (I2_S) and the activations (INT4)
+weights_packed = pack_matrix_i2_s(weights_np)           # shape (n_rows, ceil(n_cols / 128) * 32)
+activation_packed = pack_activation_int4(activation_np) # shape (ceil(n_cols / 128) * 64,)
+
+# 4. Execute the AVX2 GEMV kernel
+result = compute_gemv_i2_s_a4(weights_packed, activation_packed, n_rows, n_cols)
+
+# 5. Verify against NumPy
+assert np.array_equal(result, weights_np.astype(np.int32) @ activation_np.astype(np.int32))
 ```
 
 ## 🛠️ How it Works Under the Hood
@@ -149,15 +178,18 @@ When you call `quantizer.unwrap(module, leave_quantized=<leave_quantized>)`:
 
 ## 🗺️ Roadmap
 
-- [x] Non-invasive layer wrapping architecture using `torch.nn.utils.parametrize` and forward pre-hooks.
-- [x] Ternary and binary weight quantization with Straight-Through Estimator (STE) support.
-- [x] INT8 and INT4 activation quantization with Straight-Through Estimator (STE) support.
-- [x] `unwrap` function to restore the converted quantized model back to its original.
-- [ ] INT8 and INT4 weight quantization with Straight-Through Estimator (STE) support.
-- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on CPU.
-  - [x] AVX2 kernel for GEMV operation (W1.58A8), compatible with `numpy` array.
-  - [ ] AVX2 kernel for GEMM/Conv operation (W1.58A8).
-- [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on NVIDIA GPU.
+- Quantization:
+  - [x] Non-invasive layer wrapping architecture using `torch.nn.utils.parametrize` and forward pre-hooks.
+  - [x] Ternary and binary weight quantization (per-tensor/dimension) with Straight-Through Estimator (STE) support.
+  - [x] INT8 and INT4 activation quantization (per-tensor/dimension) with Straight-Through Estimator (STE) support.
+  - [x] `unwrap` function to restore the converted quantized model back to its original.
+  - [ ] Weight quantization (per-block) with Straight-Through Estimator (STE) support.
+- Kernels:
+  - [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on CPU.
+    - [x] AVX2 kernel for GEMV operation (W1.58A8), compatible with `numpy` array.
+    - [x] AVX2 kernel for GEMV operation (W1.58A4), compatible with `numpy` array.
+    - [ ] AVX2 kernel for GEMM/Conv operation (W1.58A8/W1.58A4).
+  - [ ] Custom kernels for BitNet b1.58 Linear/Conv operations, compatible with `ONNX`/`PyTorch` on NVIDIA GPU.
 
 ## 📄 License
 

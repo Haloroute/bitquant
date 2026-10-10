@@ -1,7 +1,12 @@
 #include "pack.h"
 #include <cstring>
 
+// ============================================================
 // Function to pack a 1.58-bit weight matrix in INT8 format into I2_S format
+// Conversion: ternary int8 weights {-1,0,1} -> GGML I2_S (2 bits/weight, stored
+// as w+1). Per 128-column block: byte i holds cols i, i+32, i+64, i+96 at bits
+// [7:6],[5:4],[3:2],[1:0]. Output size: n_rows * ceil(n_cols / 128) * 32 bytes.
+// ============================================================
 void pack_2d_i2s(const int8_t *weight, uint8_t *output, int n_rows,
                  int n_cols) {
   // Calculate the number of columns padded to a multiple of 128
@@ -40,4 +45,24 @@ void pack_2d_i2s(const int8_t *weight, uint8_t *output, int n_rows,
       }
     }
   }
+}
+
+// ============================================================
+// Function to pack a INT4 activation vector in INT8 format into A4 format
+// Conversion: INT4 activations (int8 values in [-7, 7]) -> packed INT4 for
+// gemv_i2_s_a4. Every 32 bytes hold 64 values: byte i = A[i] << 4 | A[i + 32]
+// (two's-complement nibbles). Nibbles past n_cols are 0. The output is
+// zero-padded to a multiple of 128 columns (64 bytes) so it lines up with the
+// I2_S weight blocks. Output size: ceil(n_cols / 128) * 64 bytes.
+// ============================================================
+void pack_1d_int4(const int8_t* act_in, uint8_t* act_out, int n_cols) {
+    const int n_cols_padded = (n_cols + 127) & ~127;
+    auto nib = [&](int col) -> uint8_t {
+        return (col < n_cols) ? (static_cast<uint8_t>(act_in[col]) & 0x0F) : 0;
+        };
+    for (int cb = 0; cb < n_cols_padded; cb += 64) {
+        uint8_t* out = act_out + cb / 2;
+        for (int i = 0; i < 32; ++i)
+            out[i] = static_cast<uint8_t>((nib(cb + i) << 4) | nib(cb + i + 32));
+    }
 }
